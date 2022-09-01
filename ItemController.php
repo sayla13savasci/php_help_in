@@ -3,16 +3,15 @@
 namespace App\Http\Controllers\Stationery;
 
 use Carbon\Carbon;
-use http\Env\Response;
-use Illuminate\Foundation\Auth\User;
+use http\Client\Curl\User;
 use Illuminate\Http\Request;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
-use App\Services\PayUService\Exception;
-use mysql_xdevapi\Table;
-
+use Illuminate\Support\Facades\Input;
+use Illuminate\Support\Facades\Redirect;
+use Illuminate\Support\Facades\Validator;
+use Maatwebsite\Excel\Facades\Excel;
 
 class ItemController extends Controller
 {
@@ -24,21 +23,191 @@ class ItemController extends Controller
         $types = DB::select("SELECT DISTINCT(IT_NAME) TYPE,IT_ID  FROM MIS.IT_ITEM_TYPE_MASTER");
         return view('stationery.itemTypes', ['types'=>$types]);
     }
+
     public function getItems(){
         $catData = DB::select("SELECT * FROM MIS.IT_CATEGORY");
         $types = DB::select("SELECT DISTINCT(IT_NAME) TYPE,IT_ID  FROM MIS.IT_ITEM_TYPE_MASTER");
         return view('stationery.items', ['types'=>$types,'cats'=>$catData]);
     }
+
     public function getCategory(Request $request){
         $catData = DB::select("SELECT * FROM MIS.IT_CATEGORY
         WHERE ICAT_NO = decode ('$request->cat_no','All',ICAT_NO,'$request->cat_no')");
         return response()->json($catData);
+    }
+
+    public function stockReport(){
+        $itemData = DB::select("SELECT * FROM MIS.IT_ITEM_MASTER ORDER BY ITEM_ID");
+        return view('stationery.stockReport', ['items'=>$itemData]);
+    }
+
+    public function getStockReport(Request $request){
+        $plantId = Auth::user()->plant_id;
+        $main_id = $request->main_id;
+        $cwip_id = $request->cwip_id;
+        $po_number = $request->po_number;
+        $pr_number = $request->pr_number;
+        $rdate = $request->rdate;
+        $gl = $request->gl;
+        $cost_center = $request->cost_center;
+        $item_id = $request->item_id;
+        $item_name = $request->item_name;
+
+        DB::setDateFormat("DD-MM-RR");
+
+        $QRY = "SELECT * FROM MIS.IT_OPENING_STOCK
+        WHERE COMPANY_CODE = '1000' AND PLANT_ID = '$plantId'";
+
+        if($main_id != ""){
+            $QRY .= "AND MAIN_ID = '$main_id' ";
+        }
+        if($cwip_id != ""){
+            $QRY .= "AND CWIP_ID = '$cwip_id' ";
+        }
+        if($po_number != ""){
+            $QRY .= "AND PO_NUMBER = '$po_number' ";
+        }
+        if($pr_number != ""){
+            $QRY .= "AND PR_NUMBER = '$pr_number' ";
+        }
+        if($gl != ""){
+            $QRY .= "AND GL = '$gl' ";
+        }
+        if($cost_center != ""){
+            $QRY .= "AND COST_CENTER = '$cost_center' ";
+        }
+        if($item_id != "") {
+            $QRY .= "AND ITEM_ID = decode ('$item_id','All',ITEM_ID,'$item_id') ";
+        }
+        if($rdate != ""){
+            $QRY .= "AND to_date(RECEIVED_DATE,'DD-MM-RR') = to_date('$rdate','DD-MM-RR') ";
+        }
+        $stockData = DB::select($QRY);
+        return response()->json($stockData);
+    }
+
+    public function openingStock(){
+        $companyData = DB::select("select distinct com_id,com_name,sap_com_id from hrms.company_info@WEB_TO_HRMS  WHERE sap_com_id = '1000' order by com_id ");
+        $itemData = DB::select("SELECT * FROM MIS.IT_ITEM_MASTER ORDER BY ITEM_ID");
+
+        $stckData = DB::select("SELECT * FROM MIS.IT_OPENING_STOCK");
+        return view('stationery.openingStock', ['stckData'=>$stckData,'companyData' => $companyData,
+            'plant_id'=>Auth::user()->plant_id,'item_data'=>$itemData]);
+    }
+    public function downloadFile(){
+        $file = storage_path("app\public\sample_files\openingStockReport.xlsx");
+        return response()->download($file);
+    }
+    public function uploadStockData()
+    {
+        $uid = Auth::user()->user_id;
+        $file_name = Input::file('upload_file');
+        $date = Carbon::now()->format('Y-m-d H:m:s');
+
+        //validation
+        $rules = array('upload_file' => 'required'); //'required'
+        $msg = array('upload_file.required' => 'This field is required');
+        $validator_empty = Validator::make(array('upload_file' => $file_name), $rules, $msg);
+
+        if ($validator_empty->fails()) {
+            $notification = array(
+                'message' => 'Please upload a file!',
+                'alert-type' => 'error'
+            );
+            return Redirect::to('stationery/form/openingStock')->withErrors($validator_empty)->with($notification);
+        }else if ($validator_empty->passes()) {
+            $ext = strtolower($file_name->getClientOriginalExtension());
+            $validator = Validator::make(
+                array('ext' => $ext),
+                array('ext' => 'in:xls,xlsx')
+            );
+            if ($validator->fails()) {
+                $notification = array(
+                    'message' => 'Please Upload excel file!',
+                    'alert-type' => 'error'
+                );
+                return Redirect::to('stationery/form/openingStock')->withErrors($validator)->with($notification);
+            } else if ($validator->passes()) {
+                $data = Excel::load($file_name, function ($reader) {})->get();
+                if (!empty($data) && $data->count()) {
+                    foreach ($data as $key => $value) {
+                        $uniqueData[] = [
+                            'main_id' => trim($value->main_id),
+                            'cwip_id' => trim($value->cwip_id),
+                            'item_id' => trim($value->item_id)
+                        ];
+                        $insert[] = [
+                            'company_code' => '1000',
+                            'plant_id' => trim($value->plant_id),
+                            'main_id' => trim($value->main_id),
+                            'cwip_id' => trim($value->cwip_id),
+                            'po_number' => trim($value->po_number),
+                            'pr_number' => trim($value->pr_number),
+                            'gl' => trim($value->gl),
+                            'cost_center' => trim($value->cost_center),
+                            'item_id' => trim($value->item_id),
+                            'item_name' => trim($value->item_name),
+                            'opening_quantity' => trim($value->opening_quantity),
+                            'unit' => trim($value->unit),
+                            'received_date' => Carbon::parse(trim($value->received_date))->format('Y-m-d'),
+                            'create_user' => $uid,
+                            'cretae_date' => $date
+                        ];
+                    }
+                    if (!empty($insert)) {
+                        $count = count($insert);
+                        $unique = array_map("unserialize", array_unique(array_map("serialize", $uniqueData)));
+                        if($count > count($unique)){
+                            $notification = array(
+                                'message' => 'Duplicate data found in the excel file!',
+                                'alert-type' => 'error'
+                            );
+                            return Redirect::to('stationery/form/openingStock')->with($notification);
+                        }else{
+                            try {
+                                foreach ($insert as $k => $row) {
+                                    DB::insert('insert into MIS.IT_OPENING_STOCK ( COMPANY_CODE, PLANT_ID, MAIN_ID, CWIP_ID, PO_NUMBER, PR_NUMBER, GL, COST_CENTER, ITEM_ID, ITEM_NAME, OPENING_QTY, UNIT, RECEIVED_DATE, CREATE_DATE, CREATE_USER ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',['1000', $row['plant_id'], $row['main_id'], $row['cwip_id'], $row['po_number'], $row['pr_number'], $row['gl'], $row['cost_center'], $row['item_id'], $row['item_name'], $row['opening_quantity'], $row['unit'], $row['received_date'], $date, $uid]);
+                                }
+                                $notification = array(
+                                    'message' => 'File Uploaded successfully! ',
+                                    'alert-type' => 'success'
+                                );
+                                return Redirect::to('stationery/form/openingStock')->with($notification);
+                            } catch (\Exception $ee) {
+                                DB::rollBack();
+                                $notification = array(
+                                    'message' => 'Database Error!',
+                                    'alert-type' => 'error'
+                                );
+                                return Redirect::to('stationery/form/openingStock')->with($notification);
+                            }
+                        }
+                    }else{
+                        $notification = array(
+                            'message' => 'upload excel column format not valid!',
+                            'alert-type' => 'error'
+                        );
+                        return Redirect::to('stationery/form/openingStock')->with($notification);
+                    }
+                }
+            }
+        }
     }
     public function getISTnames(Request $request){
         $istData = DB::select("SELECT * FROM MIS.IT_ITEM_TYPE_MASTER
         WHERE IT_ID = decode ('$request->it_id','All',IT_ID,'$request->it_id')");
         return response()->json($istData);
     }
+
+    public function getItemGL(Request $request){
+        if($request->item_id != ""){
+            $glData = DB::select("SELECT GL FROM MIS.IT_ITEM_MASTER WHERE ITEM_ID = '$request->item_id'");
+            return response()->json($glData);
+        }else{
+            return "";
+        }
+    }
+
     public function getItemNames(Request $request){
         $it_id = $request->it_id;
         $ist_id = $request->ist_id;
@@ -49,13 +218,16 @@ class ItemController extends Controller
               IST_ID = decode ('$ist_id','All',IST_ID,'$ist_id') AND 
               ICAT_NO = decode ('$icat_no','All',ICAT_NO,'$icat_no')
         ");
+
         return response()->json($itemData);
     }
+
     public function getTypeSubtypeData(Request $request){
         $istData = DB::select("SELECT * FROM MIS.IT_ITEM_TYPE_MASTER
         WHERE IT_ID = decode ('$request->it_id','All',IT_ID,'$request->it_id') AND IST_ID = decode ('$request->ist_id','All',IST_ID,'$request->ist_id')");
         return response()->json($istData);
     }
+
     public function getItemReport(Request $request){
         $it_id = $request->it_id;
         $ist_id = $request->ist_id;
@@ -84,6 +256,43 @@ class ItemController extends Controller
                             UPDATE_USER = '$uid',
                             UPDATE_DATE = '$date'
                         WHERE ICAT_NO = '$icat_no'");
+            return response()->json(['response'=> $result]);
+        }else{
+            return response()->json(['response'=> 2]);
+        }
+    }
+    public function updateStockReport(Request $request){
+        $uid = Auth::user()->user_id;
+
+        $stock_id = $request->stock_id;
+        $main_id = $request->main_id;
+        $cwip_id = $request->cwip_id;
+        $po_number = $request->po_number;
+        $pr_number = $request->pr_number;
+        $rdate = Carbon::parse($request->rdate)->format('Y-m-d');
+        $cost_center = $request->cost_center;
+        $opening_qty = $request->opening_qty;
+        $unit = $request->unit;
+
+        $date = Carbon::now()->format('Y-m-d H:m:s');
+
+        if($stock_id != "" && $main_id != "" && $cwip_id != "" && $po_number != ""
+            && $pr_number != "" && $rdate != "" && $cost_center != ""
+            && $opening_qty != "" && $unit != ""){
+
+            $result =  DB::UPDATE("
+                        UPDATE MIS.IT_OPENING_STOCK
+                        SET MAIN_ID = '$main_id',
+                            CWIP_ID = '$cwip_id',
+                            PO_NUMBER = '$po_number',
+                            PR_NUMBER = '$pr_number',
+                            COST_CENTER = '$cost_center',
+                            OPENING_QTY = '$opening_qty',
+                            UNIT = '$unit',
+                            RECEIVED_DATE = '$rdate',
+                            UPDATE_USER = '$uid',
+                            UPDATE_DATE = '$date'
+                        WHERE ID = '$stock_id'");
             return response()->json(['response'=> $result]);
         }else{
             return response()->json(['response'=> 2]);
@@ -128,6 +337,34 @@ class ItemController extends Controller
         if($itype_name != ""){
             $result =  DB::insert('insert into MIS.IT_ITEM_TYPE_MASTER ( IT_ID, IT_NAME, IST_ID, IST_NAME, GL, CREATE_DATE, CREATE_USER )
                                values (?,?,?,?,?,?,?)',[$new_it_no, $itype_name, $create_istID, $create_istName, $create_gl, $date, $uid]);
+            return response()->json(['response'=> $result]);
+        }else{
+            return response()->json(['response'=> 2]);
+        }
+    }
+    public function insertStockData(Request $request){
+        $uid = Auth::user()->user_id;
+        $com_code = $request->com_code;
+        $plant_id = $request->plant_id;
+        $main_id = $request->main_id;
+        $cwip_id = $request->cwip_id;
+        $po_number = $request->po_number;
+        $pr_number = $request->pr_number;
+        $rdate = Carbon::parse($request->rdate)->format('Y-m-d');
+        $cost_center = $request->cost_center;
+        $item_id = $request->item_id;
+        $item_name = $request->item_name;
+        $oqty = $request->oqty;
+        $unit = $request->unit;
+        $gl = $request->gl;
+        $date = Carbon::now()->format('Y-m-d H:m:s');
+
+        if($com_code != "" && $plant_id != "" && $main_id != "" && $cwip_id != "" &&
+            $po_number != "" && $pr_number != "" && $rdate != "" && $cost_center != "" &&
+            $item_id != "" && $item_name != "" && $oqty != "" && $unit != ""){
+            $result =  DB::insert('insert into MIS.IT_OPENING_STOCK ( COMPANY_CODE, PLANT_ID, MAIN_ID, CWIP_ID, PO_NUMBER, PR_NUMBER, GL, COST_CENTER,
+                                  ITEM_ID, ITEM_NAME, OPENING_QTY, UNIT, RECEIVED_DATE, CREATE_DATE, CREATE_USER )
+                               values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',[$com_code, $plant_id, $main_id, $cwip_id, $po_number, $pr_number, $gl, $cost_center, $item_id, $item_name, $oqty, $unit, $rdate, $date, $uid]);
             return response()->json(['response'=> $result]);
         }else{
             return response()->json(['response'=> 2]);
@@ -241,6 +478,15 @@ class ItemController extends Controller
             return response()->json(['result'=> 2]);
         }
     }
+    public function deleteStockData(Request $request){
+        $stock_id = $request->stock_id;
+        if($stock_id != ""){
+            $result =  DB::DELETE('DELETE FROM MIS.IT_OPENING_STOCK WHERE ID = ?',[$stock_id]);
+            return response()->json(['result'=> $result]);
+        }else{
+            return response()->json(['result'=> 2]);
+        }
+    }
     public function deleteItem(Request $request){
         $id = $request->id;
 
@@ -282,7 +528,7 @@ class ItemController extends Controller
         }
     }
 
-
+   
     /*Issue Item sayla starts*/
    /* sayla starts*/
     public function issueItem(){
@@ -508,6 +754,33 @@ class ItemController extends Controller
 
     }
 
+
+    /*Approve Qty Update*/
+    public function approveQtyItem(Request $request){
+        $table_id = $request->id;
+        $approve_qty = $request->appprove_qty;
+
+
+        if($approve_qty!=''){
+
+
+            $result =  DB::UPDATE("
+                        UPDATE MIS.IT_ITEM_REQUISITION_D 
+                        SET
+                            APRV_QTY = '$approve_qty'
+                           
+                        WHERE ID = '$table_id'");
+
+
+            return response()->json(['result'=> "success"]);
+
+        }else{
+
+            return response()->json(['result'=> "error"]);
+
+        }
+    }
+
     /*Get issued item for datatable*/
     public function showIrdata(Request $request){
         $issuedItems= DB::SELECT("Select * from MIS.IT_ITEM_REQUISITION_D where ir_no = '$request->ir_no'");
@@ -515,8 +788,8 @@ class ItemController extends Controller
 
     }
     /*Issue Item sayla ends*/
-    
-    /*Item transfer starts*/
+
+     /*Item transfer starts*/
     public function transferItem(){
         $uid= Auth::user()->user_id;
 
@@ -546,6 +819,9 @@ class ItemController extends Controller
         $itr_no = $request->itr_no;
         $it_no = $request->it_no;
         $plantId = Auth::user()->plant_id;
+        if($plantId == null){
+            $plantId = '1050';
+        }
         $date = Carbon::now()->format('Y-m-d H:m:s');
         $status = 0;
 
@@ -756,9 +1032,8 @@ class ItemController extends Controller
     }
 
     /*Item transfer ends*/
-
     /* CWIP to main id starts*/
-    /*Display Chalan*/
+  /*Display Chalan*/
     public function displayChalan(){
 
         $item_name = DB::select("SELECT DISTINCT ITEM_NAME,ITEM_ID,GL FROM MIS.IT_ITEM_MASTER");
@@ -875,7 +1150,7 @@ class ItemController extends Controller
 
          $cwipItemData = json_decode($request->cwipItemData,true);
 
-        log::info($cwipItemData);
+    
 
          for($i=0;$i<sizeof($cwipItemData);$i++){
             $cwipItemData[$i]['AU_ID']='1';
@@ -886,6 +1161,9 @@ class ItemController extends Controller
             $cwipItemData[$i]['UPDATE_DATE']= '';
 
         }
+
+
+
          $status = DB::table('MIS.IT_UPGRADE_CWIPID_TO_MAINID')->insert($cwipItemData);
          if($status){
              return response()->json("success");
@@ -952,31 +1230,6 @@ class ItemController extends Controller
 
     }
 
-    public function approveQtyItem(Request $request){
-        $table_id = $request->id;
-        $approve_qty = $request->appprove_qty;
-
-
-        if($approve_qty!=''){
-
-
-            $result =  DB::UPDATE("
-                        UPDATE MIS.IT_ITEM_REQUISITION_D 
-                        SET
-                            APRV_QTY = '$approve_qty'
-                           
-                        WHERE ID = '$table_id'");
-
-
-            return response()->json(['result'=> "success"]);
-
-        }else{
-
-            return response()->json(['result'=> "error"]);
-
-        }
-    }
-
     public function deleteCwipIdToMainId(Request $request){
 
         $table_id = $request->id;
@@ -995,7 +1248,7 @@ class ItemController extends Controller
     /*CWIP to main id ends*/
 
 
-
+    /*Item Repair Starts*/
 
     /*Item repair starts*/
     public function itemRepair(){
@@ -1205,20 +1458,15 @@ class ItemController extends Controller
                 return response()->json(['status'=>'error']);
             }
 
-
-
         }else{
             return response()->json(['status'=>'error']);
 
         }
-
-
     }
 
-
+    /*Item Repair Ends*/
 
     /*sayla ends*/
 
+
 }
-
-
